@@ -28,9 +28,9 @@ pub type void = pebble_sys::standard_c::memory::void;
 #[repr(transparent)]
 pub struct CStr<T: Storage>(PhantomData<T>, str);
 
-pub struct Heap(!);
-pub struct Stack(!);
-pub struct Static(!);
+pub enum Heap {}
+pub enum Stack {}
+pub enum Static {}
 
 mod private {
 	use super::{Heap, Stack, Static};

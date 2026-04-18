@@ -1,25 +1,49 @@
 use crate::{
 	standard_c::{CStr, NotStack},
-	Box, Handle, SpecialDrop,
+	Box, Handle,
 };
-use core::{
-	marker::PhantomData,
-	mem::ManuallyDrop,
-	ops::{Deref, DerefMut},
-};
+use core::{marker::PhantomData, mem::ManuallyDrop};
 #[allow(clippy::wildcard_imports)]
 use pebble_sys::{
-	prelude::*,
 	standard_c::memory::void,
 	user_interface::window::number_window::{NumberWindow as sysNumberWindow, *},
 };
 
 use super::{WindowRef, WindowRefMut};
 
-pub struct NumberWindow<'a, T: ?Sized>(
+#[repr(C)]
+struct NumberWindowDataHeader {
+	drop_data: unsafe fn(*mut void),
+}
+
+#[repr(C)]
+struct NumberWindowDataWrapper<
+	I: FnMut(&NumberWindow<void>, &mut T),
+	D: FnMut(&NumberWindow<void>, &mut T),
+	S: FnMut(&NumberWindow<void>, &mut T),
+	T,
+> {
+	header: NumberWindowDataHeader,
+	data: NumberWindowData<I, D, S, T>,
+}
+
+unsafe fn drop_number_window_data<
+	I: FnMut(&NumberWindow<void>, &mut T),
+	D: FnMut(&NumberWindow<void>, &mut T),
+	S: FnMut(&NumberWindow<void>, &mut T),
+	T,
+>(
+	data: *mut void,
+) {
+	let _ =
+		Box::<NumberWindowDataWrapper<I, D, S, T>>::from_raw(&mut *(data as *mut NumberWindowDataWrapper<I, D, S, T>));
+}
+
+pub struct NumberWindow<'a, T>(
 	pub(crate) Handle<'a, sysNumberWindow<'a>>,
 	PhantomData<T>,
-	*mut NumberWindowDataWrapper<'a>,
+	*mut void,
+	bool,
 );
 
 pub struct NumberWindowData<
@@ -33,34 +57,6 @@ pub struct NumberWindowData<
 	pub selected: S,
 	pub context: T,
 }
-
-trait NumberWindowDataTrait {
-	fn incremented(&mut self, number_window: &NumberWindow<void>);
-	fn decremented(&mut self, number_window: &NumberWindow<void>);
-	fn selected(&mut self, number_window: &NumberWindow<void>);
-}
-
-impl<
-		I: FnMut(&NumberWindow<void>, &mut T),
-		D: FnMut(&NumberWindow<void>, &mut T),
-		S: FnMut(&NumberWindow<void>, &mut T),
-		T,
-	> NumberWindowDataTrait for NumberWindowData<I, D, S, T>
-{
-	fn incremented(&mut self, number_window: &NumberWindow<void>) {
-		(self.incremented)(number_window, &mut self.context)
-	}
-
-	fn decremented(&mut self, number_window: &NumberWindow<void>) {
-		(self.decremented)(number_window, &mut self.context)
-	}
-
-	fn selected(&mut self, number_window: &NumberWindow<void>) {
-		(self.selected)(number_window, &mut self.context)
-	}
-}
-
-pub struct NumberWindowDataWrapper<'a>(Box<'a, dyn 'a + NumberWindowDataTrait>);
 
 impl<'a, T> NumberWindow<'a, T> {
 	// TODO: This probably should take and set a set of window handlers, which can then also act as lifecycle hooks for the context.
@@ -81,13 +77,22 @@ impl<'a, T> NumberWindow<'a, T> {
 	{
 		#![allow(clippy::items_after_statements)]
 
-		let window_data_wrapper = Box::leak(
-			Box::new(NumberWindowDataWrapper(Box::new(number_window_data)?)).map_err(
-				|wrapper| Box::into_inner(unsafe { Box::downcast_unchecked(wrapper.0) }),
-			)?,
-		) as *mut NumberWindowDataWrapper;
+		let window_data_wrapper = Box::new(NumberWindowDataWrapper {
+			header: NumberWindowDataHeader {
+				drop_data: drop_number_window_data::<I, D, S, T>,
+			},
+			data: number_window_data,
+		})
+		.map_err(|wrapper| wrapper.data)?;
+		let window_data_wrapper = Box::leak(window_data_wrapper) as *mut _ as *mut void;
 
-		extern "C" fn raw_incremented<'a>(
+		extern "C" fn raw_incremented<
+			'a,
+			I: FnMut(&NumberWindow<void>, &mut T),
+			D: FnMut(&NumberWindow<void>, &mut T),
+			S: FnMut(&NumberWindow<void>, &mut T),
+			T,
+		>(
 			raw_window: &'a mut sysNumberWindow<'a>,
 			context: &mut void,
 		) {
@@ -96,23 +101,21 @@ impl<'a, T> NumberWindow<'a, T> {
 				//SAFETY: It's actually *kind of* safe to alias NumberWindow instances... But only because they store a Handle internally, which stores a pointer.
 				// Actually accessing associated data would NOT be safe, so the user-provided handlers only see a NumberWindow<void> where such access is impossible.
 				#[allow(clippy::cast_ptr_alignment)]
-				NumberWindow::<void>::from_raw_unsized(
-					raw_window,
-					context as *mut _ as *mut NumberWindowDataWrapper,
-				)
+				NumberWindow::<void>::from_raw_alias(raw_window, context)
 			};
 			unsafe {
-				//SAFETY: And here's the third concurrent use of this pointer.
-				// The reference goes out of scope before the others are used, so this is safe.
-				let context = &mut *context;
-				context
-					.cast_unchecked_mut::<NumberWindowDataWrapper>()
-					.0
-					.incremented(&fake_window)
+				let wrapper = &mut *(context as *mut NumberWindowDataWrapper<I, D, S, T>);
+				(wrapper.data.incremented)(&fake_window, &mut wrapper.data.context);
 			}
-			fake_window.abandon();
+			NumberWindow::abandon(fake_window);
 		}
-		extern "C" fn raw_decremented<'a>(
+		extern "C" fn raw_decremented<
+			'a,
+			I: FnMut(&NumberWindow<void>, &mut T),
+			D: FnMut(&NumberWindow<void>, &mut T),
+			S: FnMut(&NumberWindow<void>, &mut T),
+			T,
+		>(
 			raw_window: &'a mut sysNumberWindow<'a>,
 			context: &mut void,
 		) {
@@ -121,23 +124,21 @@ impl<'a, T> NumberWindow<'a, T> {
 				//SAFETY: It's actually *kind of* safe to alias NumberWindow instances... But only because they store a Handle internally, which stores a pointer.
 				// Actually accessing associated data would NOT be safe, so the user-provided handlers only see a NumberWindow<void> where such access is impossible.
 				#[allow(clippy::cast_ptr_alignment)]
-				NumberWindow::<void>::from_raw_unsized(
-					raw_window,
-					context as *mut _ as *mut NumberWindowDataWrapper,
-				)
+				NumberWindow::<void>::from_raw_alias(raw_window, context)
 			};
 			unsafe {
-				//SAFETY: And here's the third concurrent use of this pointer.
-				// The reference goes out of scope before the others are used, so this is safe.
-				let context = &mut *context;
-				context
-					.cast_unchecked_mut::<NumberWindowDataWrapper>()
-					.0
-					.decremented(&fake_window)
+				let wrapper = &mut *(context as *mut NumberWindowDataWrapper<I, D, S, T>);
+				(wrapper.data.decremented)(&fake_window, &mut wrapper.data.context);
 			}
-			fake_window.abandon();
+			NumberWindow::abandon(fake_window);
 		}
-		extern "C" fn raw_selected<'a>(
+		extern "C" fn raw_selected<
+			'a,
+			I: FnMut(&NumberWindow<void>, &mut T),
+			D: FnMut(&NumberWindow<void>, &mut T),
+			S: FnMut(&NumberWindow<void>, &mut T),
+			T,
+		>(
 			raw_window: &'a mut sysNumberWindow<'a>,
 			context: &mut void,
 		) {
@@ -146,47 +147,38 @@ impl<'a, T> NumberWindow<'a, T> {
 				//SAFETY: It's actually *kind of* safe to alias NumberWindow instances... But only because they store a Handle internally, which stores a pointer.
 				// Actually accessing associated data would NOT be safe, so the user-provided handlers only see a NumberWindow<void> where such access is impossible.
 				#[allow(clippy::cast_ptr_alignment)]
-				NumberWindow::<void>::from_raw_unsized(
-					raw_window,
-					context as *mut _ as *mut NumberWindowDataWrapper,
-				)
+				NumberWindow::<void>::from_raw_alias(raw_window, context)
 			};
 			unsafe {
-				//SAFETY: And here's the third concurrent use of this pointer.
-				// The reference goes out of scope before the others are used, so this is safe.
-				let context = &mut *context;
-				context
-					.cast_unchecked_mut::<NumberWindowDataWrapper>()
-					.0
-					.selected(&fake_window)
+				let wrapper = &mut *(context as *mut NumberWindowDataWrapper<I, D, S, T>);
+				(wrapper.data.selected)(&fake_window, &mut wrapper.data.context);
 			}
-			fake_window.abandon();
+			NumberWindow::abandon(fake_window);
 		}
 
 		match unsafe {
 			number_window_create(
 				label.as_c_str(),
 				NumberWindowCallbacks {
-					incremented: Some(raw_incremented),
-					decremented: Some(raw_decremented),
-					selected: Some(raw_selected),
+					incremented: Some(raw_incremented::<I, D, S, T>),
+					decremented: Some(raw_decremented::<I, D, S, T>),
+					selected: Some(raw_selected::<I, D, S, T>),
 				},
-				&mut *(window_data_wrapper as *mut _ as *mut void),
+				&mut *window_data_wrapper,
 			)
 		} {
 			Some(raw_window) => Ok(Self(
 				Handle::new(raw_window),
 				PhantomData,
 				window_data_wrapper,
+				true,
 			)),
 			None => Err(Box::into_inner(unsafe {
-				Box::downcast_unchecked(
-					Box::into_inner(Box::<NumberWindowDataWrapper>::from_raw(
-						&mut *window_data_wrapper,
-					))
-					.0,
+				Box::<NumberWindowDataWrapper<I, D, S, T>>::from_raw(
+					&mut *(window_data_wrapper as *mut NumberWindowDataWrapper<I, D, S, T>),
 				)
-			})),
+			})
+			.data),
 		}
 	}
 
@@ -197,14 +189,12 @@ impl<'a, T> NumberWindow<'a, T> {
 	/// This function is only safe if `raw_window` is a raw window handle that was previously [`.leak()`]ed from the same [`NumberWindow<T>`] variant and no other [`NumberWindow<T>`] instance has been created from it since.
 	///
 	/// [`.leak()`]: #method.leak
-	pub unsafe fn from_raw(
-		raw_window: &'a mut sysNumberWindow<'a>,
-		number_window_data_wrapper: *mut NumberWindowDataWrapper<'a>,
-	) -> Self {
+	pub unsafe fn from_raw(raw_window: &'a mut sysNumberWindow<'a>, number_window_data_wrapper: *mut void) -> Self {
 		Self(
 			Handle::new(raw_window),
 			PhantomData,
 			number_window_data_wrapper,
+			true,
 		)
 	}
 
@@ -212,12 +202,7 @@ impl<'a, T> NumberWindow<'a, T> {
 	///
 	/// Note that [`NumberWindow`] has associated heap instances beyond the raw window, so only destroying that would still leak memory.
 	#[must_use = "Not reassembling the `NumberWindow` later causes a memory leak."]
-	pub fn leak(
-		self,
-	) -> (
-		&'a mut sysNumberWindow<'a>,
-		*mut NumberWindowDataWrapper<'a>,
-	)
+	pub fn leak(self) -> (&'a mut sysNumberWindow<'a>, *mut void)
 	where
 		T: 'a,
 	{
@@ -226,7 +211,7 @@ impl<'a, T> NumberWindow<'a, T> {
 	}
 }
 
-impl<'a, T: ?Sized> NumberWindow<'a, T> {
+impl<'a, T> NumberWindow<'a, T> {
 	#[must_use]
 	pub fn window(&self) -> WindowRef<'_> {
 		WindowRef(Handle::new(unsafe {
@@ -266,20 +251,12 @@ impl<'a, T: ?Sized> NumberWindow<'a, T> {
 		unsafe { number_window_get_value(&*self.0) }
 	}
 
-	/// # Safety
-	///
-	/// It's actually safe to assemble [`NumberWindow`] instances with mismatched type parameters iff the type parameter assembled against is unsized,
-	/// because this data can never be directly accessed outside the destructor.
-	///
-	/// However, dropping such a value will always panic, so adding this to the public API would be a *really* bad idea.
-	unsafe fn from_raw_unsized(
-		raw_window: &'a mut sysNumberWindow<'a>,
-		number_window_data_wrapper: *mut NumberWindowDataWrapper<'a>,
-	) -> Self {
+	unsafe fn from_raw_alias(raw_window: &'a mut sysNumberWindow<'a>, number_window_data_wrapper: *mut void) -> Self {
 		Self(
 			Handle::new(raw_window),
 			PhantomData,
 			number_window_data_wrapper,
+			false,
 		)
 	}
 
@@ -289,50 +266,23 @@ impl<'a, T: ?Sized> NumberWindow<'a, T> {
 	}
 }
 
-impl<'a, T> Deref for NumberWindow<'a, T> {
-	type Target = NumberWindow<'a, void>;
-
-	fn deref(&self) -> &Self::Target {
-		unsafe {
-			//SAFETY: Same memory layout, no access to data.
-			&*(self as *const _ as *const Self::Target)
-		}
-	}
-}
-
-impl<'a, T> DerefMut for NumberWindow<'a, T> {
-	fn deref_mut(&mut self) -> &mut Self::Target {
-		unsafe {
-			//SAFETY: Same memory layout, no access to data.
-			&mut *(self as *mut _ as *mut Self::Target)
-		}
-	}
-}
-
-impl<'a, T: ?Sized> Drop for NumberWindow<'a, T> {
+impl<'a, T> Drop for NumberWindow<'a, T> {
 	fn drop(&mut self) {
-		self.special_drop()
-	}
-}
+		if !self.3 {
+			return;
+		}
 
-impl<'a, T: ?Sized> SpecialDrop for NumberWindow<'a, T> {
-	default fn special_drop(&mut self) {
-		panic!("Dropping unsized `NumberWindow<T>`s is illegal")
-	}
-}
-
-impl<'a, T: Sized> SpecialDrop for NumberWindow<'a, T> {
-	fn special_drop(&mut self) {
 		unsafe {
 			//SAFETY: window_data is created and leaked in the only accessible constructor.
 			//SAFETY: self.0 isn't accessed after this.
 			let data_wrapper = self.2;
+			let drop_data = (*(data_wrapper as *mut NumberWindowDataHeader)).drop_data;
 			// Detaching the lifetime here takes a bit of work.
 			let sys_number_window = self.0.duplicate().unwrap() as *mut _ as *mut void as *mut _;
 
 			// Destroy the window, THEN drop its data.
 			number_window_destroy(&mut *sys_number_window);
-			Box::<NumberWindowDataWrapper>::from_raw(&mut *data_wrapper);
+			drop_data(data_wrapper);
 		}
 	}
 }

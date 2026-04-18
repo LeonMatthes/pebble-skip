@@ -2,7 +2,7 @@ use super::window::Window;
 #[allow(clippy::wildcard_imports)]
 use pebble_sys::user_interface::window_stack::*;
 
-pub fn push<T: ?Sized>(window: &Window<T>, animated: bool) {
+pub fn push<T>(window: &Window<T>, animated: bool) {
 	unsafe {
 		//SAFETY: This wrapper does not allow reacquiring windows from the window stack.
 		window_stack_push(&mut *(window.0.as_mut_unchecked() as *mut _), animated)
@@ -19,7 +19,7 @@ pub fn pop_all(animated: bool) {
 }
 
 #[allow(clippy::must_use_candidate)] // side effects
-pub fn remove<T: ?Sized>(window: &Window<T>, animated: bool) -> bool {
+pub fn remove<T>(window: &Window<T>, animated: bool) -> bool {
 	unsafe { window_stack_remove(window.0.as_mut_unchecked(), animated) }
 }
 
@@ -29,6 +29,6 @@ pub fn is_empty() -> bool {
 }
 
 #[must_use]
-pub fn contains_window<T: ?Sized>(window: &Window<T>) -> bool {
+pub fn contains_window<T>(window: &Window<T>) -> bool {
 	unsafe { window_stack_contains_window(window.0.as_mut_unchecked()) }
 }

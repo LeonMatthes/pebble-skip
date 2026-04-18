@@ -1,8 +1,8 @@
 use core::{
 	cmp::Ordering,
 	convert::TryInto,
-	intrinsics::drop_in_place,
-	mem::{needs_drop, size_of, size_of_val_raw, MaybeUninit},
+	mem::{needs_drop, size_of, size_of_val, MaybeUninit},
+	ptr::drop_in_place,
 	ptr::NonNull,
 	slice,
 };
@@ -145,8 +145,9 @@ pub unsafe fn resize_realloc<'a, T>(
 /// This function is only safe if `slot` was obtained from an allocation function in this module.
 pub unsafe fn drop_free<T: ?Sized>(slot: &'static mut T) {
 	let ptr = slot as *mut T;
+	let size = size_of_val(slot);
 	drop_in_place(ptr);
-	match size_of_val_raw(ptr) {
+	match size {
 		0 => (),
 		_ => sys_memory::free(&mut *(ptr as *mut _)),
 	}

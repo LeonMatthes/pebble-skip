@@ -3,14 +3,6 @@
 //! For now, please also refer to the C API documentation at <https://developer.rebble.io/developer.pebble.com/docs/c/index.html> for more information.
 
 #![no_std]
-#![feature(coerce_unsized)]
-#![feature(layout_for_ptr)]
-#![feature(maybe_uninit_extra)]
-#![feature(maybe_uninit_ref)]
-#![feature(maybe_uninit_slice)]
-#![feature(min_specialization)]
-#![feature(never_type)]
-#![feature(unsize)]
 #![doc(html_root_url = "https://docs.rs/pebble-skip/0.0.1")]
 #![warn(clippy::pedantic)]
 #![allow(clippy::match_bool)]
@@ -18,11 +10,11 @@
 
 use core::{
 	future::Future,
-	intrinsics::drop_in_place,
-	marker::{PhantomData, Unsize},
-	mem::{size_of_val_raw, ManuallyDrop, MaybeUninit},
-	ops::{CoerceUnsized, Deref, DerefMut},
+	marker::PhantomData,
+	mem::{size_of_val, ManuallyDrop, MaybeUninit},
+	ops::{Deref, DerefMut},
 	pin::Pin,
+	ptr::drop_in_place,
 	str,
 	task::{Context, Poll},
 };
@@ -37,8 +29,8 @@ pub mod graphics;
 pub mod standard_c;
 pub mod user_interface;
 
-trait SpecialDrop {
-	fn special_drop(&mut self);
+unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
+	&mut *(slice as *mut [MaybeUninit<T>] as *mut [T])
 }
 
 /// Just a standard Box, more or less. The main difference is that its constructor is fallible instead of panicking.
@@ -83,7 +75,7 @@ impl<'a> Box<'a, [MaybeUninit<u8>]> {
 
 	#[must_use]
 	pub fn assume_init(r#box: Self) -> Box<'a, [u8]> {
-		unsafe { Box::from_raw(MaybeUninit::slice_assume_init_mut(Box::leak(r#box))) }
+		unsafe { Box::from_raw(assume_init_slice_mut(Box::leak(r#box))) }
 	}
 }
 
@@ -92,8 +84,9 @@ impl<'a, T: ?Sized> Drop for Box<'a, T> {
 		unsafe {
 			//SAFETY: ptr is always a valid pointer here that originally belonged to a sized type.
 			let ptr = self.0 as *mut T;
+			let size = size_of_val(&*self.0);
 			drop_in_place(ptr);
-			match size_of_val_raw(ptr) {
+			match size {
 				0 => (),
 				_ => free(&mut *(ptr as *mut _)),
 			};
@@ -118,16 +111,6 @@ impl<'a, T: ?Sized> Box<'a, T> {
 	pub unsafe fn from_raw(raw: &'a mut T) -> Self {
 		Self(raw)
 	}
-
-	/// Reinterprets a [`Box`] of an type `T` into its original sized type `Box<U>`.
-	///
-	/// # Safety
-	///
-	/// Iff this instance was created from a value memory-compatible to `U`.
-	#[must_use]
-	pub unsafe fn downcast_unchecked<U: Unsize<T>>(r#box: Self) -> Box<'a, U> {
-		Box::from_raw(&mut *(Box::leak(r#box) as *mut _ as *mut U))
-	}
 }
 
 impl<'a, T: ?Sized> Deref for Box<'a, T> {
@@ -143,8 +126,6 @@ impl<'a, T: ?Sized> DerefMut for Box<'a, T> {
 		self.0
 	}
 }
-
-impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Box<'a, U>> for Box<'a, T> {}
 
 impl<'a, T: ?Sized> Unpin for Box<'a, T> {}
 
@@ -167,7 +148,7 @@ impl Box<'static, CStr<Heap>> {
 		unsafe {
 			memcpy_uninit(&mut mem[..value.len()], value.as_bytes());
 			mem[value.len()].write(0);
-			let slice = MaybeUninit::slice_assume_init_mut(mem);
+			let slice = assume_init_slice_mut(mem);
 			let str = str::from_utf8_unchecked_mut(slice);
 			let c_str = CStr::from_zero_terminated_unchecked_mut(str);
 			Ok(Self::from_raw(c_str))

@@ -1,5 +1,5 @@
 use super::window_stack;
-use crate::{graphics::graphics_types::Color8, Box, Handle, SpecialDrop};
+use crate::{graphics::graphics_types::Color8, Box, Handle};
 use core::{
 	marker::PhantomData,
 	mem::ManuallyDrop,
@@ -15,14 +15,30 @@ use unsafe_unwrap::UnsafeUnwrap;
 
 pub mod number_window;
 
+#[repr(C)]
+struct WindowDataHeader {
+	drop_data: unsafe fn(*mut void),
+}
+
+#[repr(C)]
+struct WindowData<'a, H, T> {
+	header: WindowDataHeader,
+	user_data: Option<T>,
+	window_handlers: Box<'a, H>,
+}
+
+unsafe fn drop_window_data<H, T>(data: *mut void) {
+	let _ = Box::<WindowData<H, T>>::from_raw(&mut *(data as *mut WindowData<H, T>));
+}
+
 #[repr(transparent)] // Needed for WindowRef and WindowRefMut to work.
-pub struct Window<T: ?Sized>(pub(crate) Handle<'static, sysWindow>, PhantomData<T>);
+pub struct Window<T>(pub(crate) Handle<'static, sysWindow>, PhantomData<T>);
 
 #[repr(transparent)]
-pub struct WindowRef<'a>(Handle<'a, sysWindow>);
+pub struct WindowRef<'a>(pub(crate) Handle<'a, sysWindow>);
 
 #[repr(transparent)]
-pub struct WindowRefMut<'a>(Handle<'a, sysWindow>);
+pub struct WindowRefMut<'a>(pub(crate) Handle<'a, sysWindow>);
 
 pub struct WindowHandlers<L: FnMut() -> T, A: FnMut(&mut T), D: FnMut(&mut T), U: FnMut(T), T> {
 	pub load: L,
@@ -58,11 +74,6 @@ impl<L: FnMut() -> T, A: FnMut(&mut T), D: FnMut(&mut T), U: FnMut(T), T> Window
 	}
 }
 
-struct WindowData<'a, T> {
-	user_data: Option<T>,
-	window_handlers: Box<'a, dyn 'a + WindowHandlersTrait<T>>,
-}
-
 pub struct WindowCreationError<L: FnMut() -> T, A: FnMut(&mut T), D: FnMut(&mut T), U: FnMut(T), T>
 {
 	pub window_handlers: WindowHandlers<L, A, D, U, T>,
@@ -91,31 +102,31 @@ impl<T> Window<T> {
 	{
 		#![allow(clippy::items_after_statements)]
 
+		let window_handlers = Box::new(window_handlers)
+			.map_err(|window_handlers| WindowCreationError { window_handlers })?;
 		let window_data = Box::new(WindowData {
-			user_data: None,
-			window_handlers: Box::new(window_handlers)
-				.map_err(|window_handlers| WindowCreationError { window_handlers })?,
+			header: WindowDataHeader {
+				drop_data: drop_window_data::<WindowHandlers<L, A, D, U, T>, T>,
+			},
+			user_data: None::<T>,
+			window_handlers,
 		})
 		.map_err(|window_data| WindowCreationError::<_, _, _, _, T> {
-			window_handlers: Box::into_inner(unsafe {
-				Box::downcast_unchecked(window_data.window_handlers)
-			}),
+			window_handlers: Box::into_inner(window_data.window_handlers),
 		})?;
 		let raw_window = match unsafe { window_create() } {
 			Some(raw_window) => raw_window,
 			None => {
 				return Err(WindowCreationError {
-					window_handlers: Box::into_inner(unsafe {
-						Box::downcast_unchecked(Box::into_inner(window_data).window_handlers)
-					}),
+					window_handlers: Box::into_inner(Box::into_inner(window_data).window_handlers),
 				});
 			}
 		};
 
-		extern "C" fn raw_load<T>(raw_window: &mut sysWindow) {
+		extern "C" fn raw_load<H: WindowHandlersTrait<T>, T>(raw_window: &mut sysWindow) {
 			let window_data = unsafe {
 				window_get_user_data(raw_window)
-					.cast::<WindowData<T>>()
+					.cast::<WindowData<H, T>>()
 					.as_mut()
 					.unsafe_unwrap()
 			};
@@ -124,10 +135,10 @@ impl<T> Window<T> {
 				.replace(window_data.window_handlers.load())
 				.debugless_unwrap_none();
 		}
-		extern "C" fn raw_appear<T>(raw_window: &mut sysWindow) {
+		extern "C" fn raw_appear<H: WindowHandlersTrait<T>, T>(raw_window: &mut sysWindow) {
 			let window_data = unsafe {
 				window_get_user_data(raw_window)
-					.cast::<WindowData<T>>()
+					.cast::<WindowData<H, T>>()
 					.as_mut()
 					.unsafe_unwrap()
 			};
@@ -135,10 +146,10 @@ impl<T> Window<T> {
 				.window_handlers
 				.appear(unsafe { window_data.user_data.as_mut().unsafe_unwrap() });
 		}
-		extern "C" fn raw_disappear<T>(raw_window: &mut sysWindow) {
+		extern "C" fn raw_disappear<H: WindowHandlersTrait<T>, T>(raw_window: &mut sysWindow) {
 			let window_data = unsafe {
 				window_get_user_data(raw_window)
-					.cast::<WindowData<T>>()
+					.cast::<WindowData<H, T>>()
 					.as_mut()
 					.unsafe_unwrap()
 			};
@@ -146,10 +157,10 @@ impl<T> Window<T> {
 				.window_handlers
 				.disappear(unsafe { window_data.user_data.as_mut().unsafe_unwrap() });
 		}
-		extern "C" fn raw_unload<T>(raw_window: &mut sysWindow) {
+		extern "C" fn raw_unload<H: WindowHandlersTrait<T>, T>(raw_window: &mut sysWindow) {
 			let window_data = unsafe {
 				window_get_user_data(raw_window)
-					.cast::<WindowData<T>>()
+					.cast::<WindowData<H, T>>()
 					.as_mut()
 					.unsafe_unwrap()
 			};
@@ -160,17 +171,14 @@ impl<T> Window<T> {
 
 		unsafe {
 			//SAFETY: window_data is only retrieved and destroyed in the destructor, *after* destroying the window.
-			window_set_user_data(raw_window, {
-				let mem: &mut void = Box::leak(window_data).into();
-				mem
-			});
+			window_set_user_data(raw_window, Box::leak(window_data) as *mut _ as *mut void);
 			window_set_window_handlers(
 				raw_window,
 				sysWindowHandlers {
-					load: Some(raw_load::<T>),
-					appear: Some(raw_appear::<T>),
-					disappear: Some(raw_disappear::<T>),
-					unload: Some(raw_unload::<T>),
+					load: Some(raw_load::<WindowHandlers<L, A, D, U, T>, T>),
+					appear: Some(raw_appear::<WindowHandlers<L, A, D, U, T>, T>),
+					disappear: Some(raw_disappear::<WindowHandlers<L, A, D, U, T>, T>),
+					unload: Some(raw_unload::<WindowHandlers<L, A, D, U, T>, T>),
 				},
 			)
 		}
@@ -205,7 +213,7 @@ impl<T> Window<T> {
 	}
 }
 
-impl<T: ?Sized> Window<T> {
+impl<T> Window<T> {
 	#[allow(clippy::must_use_candidate)] // side effects
 	pub fn hide(&self, animated: bool) -> bool {
 		window_stack::remove(self, animated)
@@ -232,26 +240,15 @@ impl<T: ?Sized> Window<T> {
 	}
 }
 
-impl<T: ?Sized> Drop for Window<T> {
+impl<T> Drop for Window<T> {
 	fn drop(&mut self) {
-		self.special_drop()
-	}
-}
-
-impl<T: ?Sized> SpecialDrop for Window<T> {
-	default fn special_drop(&mut self) {
-		panic!("Dropping unsized `Window<T>`s is illegal")
-	}
-}
-
-impl<T: Sized> SpecialDrop for Window<T> {
-	fn special_drop(&mut self) {
 		unsafe {
 			//SAFETY: window_data is created and leaked in the only accessible constructor.
 			//SAFETY: self.0 isn't accessed after this.
-			let window_data = window_get_user_data(&*self.0).cast();
+			let window_data = window_get_user_data(&*self.0);
+			let drop_data = (*(window_data as *mut WindowDataHeader)).drop_data;
 			window_destroy(self.0.duplicate().unwrap());
-			Box::<WindowData<T>>::from_raw(&mut *window_data);
+			drop_data(window_data);
 		}
 	}
 }
